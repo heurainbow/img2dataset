@@ -248,7 +248,7 @@ def one_process_downloader(
         meta_status.set_index('key', inplace=True)
         suc_prev = (meta_status == 'success').sum().tolist()[0]
         count = len(shard_to_dl) - suc_prev
-        print(f"resume download for {shard_name} with {count-suc_prev} left")
+        print(f"resume download for {shard_name} with {count} left")
         meta_status_dict = meta_status.to_dict()['status']
         key_url_list = [(key, x[url_indice]) for key, x in shard_to_dl if \
             meta_status_dict[compute_key(key, shard_id, oom_sample_per_shard, oom_shard_count)] != 'success']
