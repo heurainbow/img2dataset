@@ -117,7 +117,17 @@ class WebDatasetSampleWriter:
         self.oom_shard_count = oom_shard_count
         shard_name = "{shard_id:0{oom_shard_count}d}".format(shard_id=shard_id, oom_shard_count=oom_shard_count)
         self.shard_id = shard_id
-        self.tarwriter = wds.TarWriter(f"{output_folder}/{shard_name}.tar")
+        file_name = f"{output_folder}/{shard_name}.tar"
+        if os.path.isfile(file_name):
+            existing_resume_files = glob.glob(f"{output_folder}/{shard_name}_resume*.tar")
+            if len(existing_resume_files) == 0:
+                start_resume_id = 0
+            else:
+                start_resume_id = max([int(x.split("/")[-1].split(".")[0].split("_resume")[-1]) \
+                    for x in existing_resume_files]) + 1
+            file_name = f"{output_folder}/{shard_name}_resume{start_resume_id}.tar"
+
+        self.tarwriter = wds.TarWriter(file_name)
         self.save_caption = save_caption
         self.save_metadata = save_metadata
 
@@ -185,9 +195,24 @@ def one_process_downloader(
     timeout,
     number_sample_per_shard,
     oom_shard_count,
+    resume,
 ):
     """Function to start an image downloading in one process"""
     shard_id, shard_to_dl = row
+    valid_resume = False
+    if resume:
+        shard_name = "%05d" % shard_id
+        meta_file = f"{output_folder}/{shard_name}.parquet"
+        tar_file = f"{output_folder}/{shard_name}.tar"
+        if os.path.isfile(meta_file):
+            if os.path.isfile(tar_file):
+                print(f"valid resume for {meta_file}, {tar_file}")
+                valid_resume = True
+            else:
+                print(f"{meta_file} exists but no {tar_file} found")
+        else:
+            print(f"invalid {tar_file} with no {meta_file}")
+            os.system(f"rm -rf {tar_file}")
 
     start_time = time.perf_counter()
     status_dict = CappedCounter()
@@ -216,6 +241,19 @@ def one_process_downloader(
 
     sample_writer = sample_writer_class(shard_id, output_folder, save_caption, save_metadata, oom_shard_count)
     oom_sample_per_shard = math.ceil(math.log10(number_sample_per_shard))
+
+    if valid_resume:
+        meta_previous = pd.read_parquet(meta_file)
+        meta_status = meta_previous[['key', 'status']]
+        meta_status.set_index('key', inplace=True)
+        suc_prev = (meta_status == 'success').sum().tolist()[0]
+        count = len(shard_to_dl) - suc_prev
+        print(f"resume download for {shard_name} with {count-suc_prev} left")
+        meta_status_dict = meta_status.to_dict()['status']
+        key_url_list = [(key, x[url_indice]) for key, x in shard_to_dl if \
+            meta_status_dict[compute_key(key, shard_id, oom_sample_per_shard, oom_shard_count)] != 'success']
+
+
     with ThreadPool(thread_count) as thread_pool:
         for key, img_stream, error_message in thread_pool.imap_unordered(
             lambda x: download_image(x, timeout=timeout), loader
@@ -293,6 +331,20 @@ def one_process_downloader(
     if save_metadata:
         df = pd.DataFrame(metadatas)
         shard_name = "%05d" % shard_id
+        # update meta and merge into origin tar
+        if valid_resume:
+            assert meta_previous is not None
+            print("update meta for valid resume")
+            meta_previous.set_index('key', inplace=True)
+            meta_previous.update(df.set_index('key'))
+            df = meta_previous
+            df.sort_index(inplace=True)
+            df.reset_index(inplace=True)
+            print('merge resume tar files')
+            tar_file = f"{output_folder}/{shard_name}.tar"
+            resume_tar_file = f"{output_folder}/{shard_name}_resume*.tar"
+            os.system(f"tar --concatenate --file={tar_file} {resume_tar_file}")
+            os.system(f'rm -rf {resume_tar_file}')
         df.to_parquet(output_folder + "/" + shard_name + ".parquet")
 
     end_time = time.perf_counter()
@@ -318,6 +370,7 @@ def download(
     enable_wandb: bool = False,
     wandb_project: str = "img2dataset",
     oom_shard_count: int = 5,
+    resume: bool = False,
 ):
     """Download is the main entry point of img2dataset, it uses multiple processes and download multiple files"""
     config_parameters = dict(locals())
@@ -337,15 +390,20 @@ def download(
     for i, input_file in enumerate(input_files):
         print("Downloading file number " + str(i + 1) + " of " + str(len(input_files)) + " called " + input_file)
         print("Loading the input file")
-        if not os.path.exists(output_folder):
-            os.mkdir(output_folder)
+        if resume:
+            print('resuming')
+            assert os.path.exists(output_folder)
             start_shard_id = 0
         else:
-            existing_top_level_files = glob.glob(output_folder + "/*")
-            if len(existing_top_level_files) == 0:
+            if not os.path.exists(output_folder):
+                os.mkdir(output_folder)
                 start_shard_id = 0
             else:
-                start_shard_id = max([int(x.split("/")[-1].split(".")[0]) for x in existing_top_level_files]) + 1
+                existing_top_level_files = glob.glob(output_folder + "/*")
+                if len(existing_top_level_files) == 0:
+                    start_shard_id = 0
+                else:
+                    start_shard_id = max([int(x.split("/")[-1].split(".")[0]) for x in existing_top_level_files]) + 1
 
         if input_format == "txt":
             images_to_dl = []
@@ -405,6 +463,7 @@ def download(
             timeout=timeout,
             number_sample_per_shard=number_sample_per_shard,
             oom_shard_count=oom_shard_count,
+            resume=resume,
         )
 
         print("Starting the downloading of this file")
